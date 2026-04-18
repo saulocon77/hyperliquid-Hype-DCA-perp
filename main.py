@@ -30,6 +30,9 @@ Variables de entorno (Railway):
   POLL_INTERVAL_SEC         — default 2.0
   TESTNET                   — default false
   SLIPPAGE                  — default 0.05
+  POST_ORDER_WAIT_SEC       — tras compra inicial, tiempo máx. esperando que aparezca la
+                              posición en la API (default 60). Evita salida en Railway por
+                              latencia entre orden y clearinghouseState.
 """
 
 from __future__ import annotations
@@ -114,6 +117,33 @@ def usd_to_size(info: Info, coin: str, usd_notional: float, mark: float) -> floa
     return round_size(info, coin, usd_notional / mark)
 
 
+def wait_for_position(
+    info: Info,
+    account: str,
+    coin: str,
+    timeout_sec: float,
+    label: str,
+) -> dict[str, Any]:
+    """Reintenta user_state hasta que exista posición en coin o se agote el tiempo."""
+    deadline = time.time() + timeout_sec
+    interval = 0.5
+    while time.time() < deadline:
+        state = info.user_state(account)
+        pos = find_position(state, coin)
+        if pos:
+            log.info("%s: posición %s detectada en API.", label, coin)
+            return pos
+        time.sleep(interval)
+    log.error(
+        "%s: sin posición en %s tras %.0fs. Revisa margen, autorización del API wallet, "
+        "ACCOUNT_ADDRESS y respuesta de la orden en logs anteriores.",
+        label,
+        coin,
+        timeout_sec,
+    )
+    sys.exit(1)
+
+
 def parse_liquidation_px(pos: dict[str, Any]) -> Optional[float]:
     raw = pos.get("liquidationPx")
     if raw is None or str(raw).strip() == "":
@@ -136,6 +166,7 @@ def main() -> None:
     poll_sec = _env_float("POLL_INTERVAL_SEC", 2.0)
     slippage = _env_float("SLIPPAGE", 0.05)
     testnet = _env_bool("TESTNET", False)
+    post_order_wait = _env_float("POST_ORDER_WAIT_SEC", 60.0)
 
     base_url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
 
@@ -167,7 +198,15 @@ def main() -> None:
             log.error("Tamaño de orden 0; abortando.")
             sys.exit(1)
         log.info("Activación: compra inicial a mercado | sz=%s | mid≈%s", sz0, mark0)
-        exchange.market_open(coin, True, sz0, slippage=slippage)
+        init_resp = exchange.market_open(coin, True, sz0, slippage=slippage)
+        log.info("Respuesta compra inicial (exchange): %s", init_resp)
+        wait_for_position(
+            info,
+            account,
+            coin,
+            post_order_wait,
+            "Tras compra inicial",
+        )
 
     armed = True
     rearm_floor: Optional[float] = None
@@ -179,7 +218,10 @@ def main() -> None:
             mark = get_mid_price(info, coin)
 
             if not pos:
-                log.warning("Sin posición en %s; el bot se detiene.", coin)
+                log.warning(
+                    "Sin posición en %s; el bot se detiene (cierre manual, TP previo o orden no reflejada).",
+                    coin,
+                )
                 sys.exit(0)
 
             assert_long_only(pos, coin)
