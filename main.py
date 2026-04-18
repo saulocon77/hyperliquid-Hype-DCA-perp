@@ -6,23 +6,30 @@ Take profit: cuando el PnL no realizado >= TAKE_PROFIT_PCT * valor nocional de l
 (default 25% del tamaño de la posición en USDC). Sin stop loss. Al cumplir el TP cierra
 y apaga el proceso (exit 0).
 
-Compras adicionales: cada vez que el precio de marca cae un DIP_PCT (default 9%) por
-debajo del precio medio de entrada (entryPx de la API), se repite una compra del mismo
-tamaño. Tras cada compra por caída, hace falta que el precio suba de nuevo por encima
-del umbral de rearmado antes de poder disparar otra (evita compras en ráfaga).
+Compras defensivas (promediar / defender): se monitorea liquidationPx de la API. Si el
+precio de mercado (mid) cae de forma que mark <= liquidationPx + LIQUIDATION_BUFFER_USD
+(default 0.10 en unidades de precio del perp, equivalente práctico a USDT/USDC), se
+ejecuta de inmediato una compra a mercado del mismo nocional. Tras cada compra defensiva,
+el precio debe superar (liquidación+buffer)*(1+REARM_PCT) antes de poder volver a armar
+(evita ráfagas).
+
+Riesgos: acercarse a la liquidación aumenta el riesgo de pérdida. Un buffer fijo en
+precio (LIQUIDATION_BUFFER_USD) no representa el mismo margen relativo al precio de HYPE
+según cotice el activo; conviene revisar y ajustar ese valor en el entorno según tu
+tolerancia y el contexto de mercado.
 
 Variables de entorno (Railway):
-  PRIVATE_KEY          — API wallet (0x...)
-  ACCOUNT_ADDRESS      — wallet principal (0x...)
-  COIN                 — default HYPE
-  POSITION_USD         — nocional por compra en USDC (default 30)
-  LEVERAGE             — default 10
-  TAKE_PROFIT_PCT      — fracción sobre el nocional (default 0.25 = 25%)
-  DIP_PCT              — fracción de caída desde el precio medio (default 0.09 = 9%)
-  REARM_PCT            — tras compra en caída, el precio debe superar dip_trigger*(1+REARM_PCT) (default 0.01)
-  POLL_INTERVAL_SEC    — default 2.0
-  TESTNET              — default false
-  SLIPPAGE             — default 0.05
+  PRIVATE_KEY               — API wallet (0x...)
+  ACCOUNT_ADDRESS           — wallet principal (0x...)
+  COIN                      — default HYPE
+  POSITION_USD              — nocional por compra en USDC (default 30)
+  LEVERAGE                  — default 10
+  TAKE_PROFIT_PCT           — fracción sobre el nocional (default 0.25 = 25%)
+  LIQUIDATION_BUFFER_USD    — distancia máxima por encima de liquidationPx (default 0.10)
+  REARM_PCT                 — tras defensa, mark debe superar umbral*(1+REARM_PCT) (default 0.01)
+  POLL_INTERVAL_SEC         — default 2.0
+  TESTNET                   — default false
+  SLIPPAGE                  — default 0.05
 """
 
 from __future__ import annotations
@@ -107,6 +114,16 @@ def usd_to_size(info: Info, coin: str, usd_notional: float, mark: float) -> floa
     return round_size(info, coin, usd_notional / mark)
 
 
+def parse_liquidation_px(pos: dict[str, Any]) -> Optional[float]:
+    raw = pos.get("liquidationPx")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def main() -> None:
     private_key = _require_env("PRIVATE_KEY")
     account = _require_env("ACCOUNT_ADDRESS")
@@ -114,7 +131,7 @@ def main() -> None:
     leverage = int(_env_float("LEVERAGE", 10))
     position_usd = _env_float("POSITION_USD", 30.0)
     tp_pct = _env_float("TAKE_PROFIT_PCT", 0.25)
-    dip_pct = _env_float("DIP_PCT", 0.09)
+    liq_buffer = _env_float("LIQUIDATION_BUFFER_USD", 0.10)
     rearm_pct = _env_float("REARM_PCT", 0.01)
     poll_sec = _env_float("POLL_INTERVAL_SEC", 2.0)
     slippage = _env_float("SLIPPAGE", 0.05)
@@ -127,12 +144,14 @@ def main() -> None:
     info = exchange.info
 
     log.info(
-        "Configurando %s | %sx aislado | compra %.2f USDC nocional | TP %.0f%% del nocional | dip -%.0f%%",
+        "Configurando %s | %sx aislado | compra %.2f USDC nocional | TP %.0f%% nocional | "
+        "defensa si mark <= liq + %.2f | rearm tras defensa %.1f%%",
         coin,
         leverage,
         position_usd,
         tp_pct * 100,
-        dip_pct * 100,
+        liq_buffer,
+        rearm_pct * 100,
     )
     exchange.update_leverage(leverage, coin, is_cross=False)
 
@@ -165,17 +184,9 @@ def main() -> None:
 
             assert_long_only(pos, coin)
 
-            entry_px = pos.get("entryPx")
-            if entry_px is None or str(entry_px).strip() == "":
-                log.warning("entryPx no disponible; reintentando…")
-                time.sleep(poll_sec)
-                continue
-
-            avg_entry = float(entry_px)
             pos_value = float(pos.get("positionValue", 0) or 0)
             pnl = float(pos.get("unrealizedPnl", 0) or 0)
 
-            # TP: 25% de ganancia sobre el nocional (tamaño) de la posición
             tp_threshold = tp_pct * abs(pos_value)
             if pnl >= tp_threshold:
                 log.info(
@@ -189,37 +200,42 @@ def main() -> None:
                 log.info("Bot desactivado tras TP (exit 0).")
                 sys.exit(0)
 
-            dip_trigger = avg_entry * (1.0 - dip_pct)
+            liq = parse_liquidation_px(pos)
+            defense_threshold: Optional[float] = None
+            if liq is not None:
+                defense_threshold = liq + liq_buffer
+            else:
+                log.warning("liquidationPx no disponible; sin compra defensiva este ciclo.")
 
             if rearm_floor is not None and mark > rearm_floor:
                 floor = rearm_floor
                 armed = True
                 rearm_floor = None
-                log.info("Rearmado dip: mark %.6f > %.6f", mark, floor)
+                log.info("Rearmado defensa: mark %.6f > %.6f", mark, floor)
 
-            if armed and mark <= dip_trigger:
-                prev_avg = avg_entry
+            if armed and defense_threshold is not None and mark <= defense_threshold:
+                T = defense_threshold
                 sz = usd_to_size(info, coin, position_usd, mark)
                 if sz <= 0:
-                    log.warning("Tamaño 0 en compra por caída; omitiendo.")
+                    log.warning("Tamaño 0 en compra defensiva; omitiendo.")
                 else:
                     log.info(
-                        "Compra por caída: mark %.6f <= medio*%.4f (dip %.6f) | sz=%s | medio=%.6f",
+                        "Compra defensiva: mark %.6f <= liq+%.4f (umbral %.6f, liq=%.6f) | sz=%s",
                         mark,
-                        1.0 - dip_pct,
-                        dip_trigger,
+                        liq_buffer,
+                        defense_threshold,
+                        liq,
                         sz,
-                        avg_entry,
                     )
                     exchange.market_open(coin, True, sz, slippage=slippage)
                     armed = False
-                    rearm_floor = prev_avg * (1.0 - dip_pct) * (1.0 + rearm_pct)
+                    rearm_floor = T * (1.0 + rearm_pct)
 
             log.info(
-                "mark=%.6f | medio=%.6f | dip_trigger=%.6f | PnL=%.4f | nocional=%.2f | armed=%s",
+                "mark=%.6f | liq=%s | umbral_def=%s | PnL=%.4f | nocional=%.2f | armed=%s",
                 mark,
-                avg_entry,
-                dip_trigger,
+                f"{liq:.6f}" if liq is not None else "n/a",
+                f"{defense_threshold:.6f}" if defense_threshold is not None else "n/a",
                 pnl,
                 abs(pos_value),
                 armed,
