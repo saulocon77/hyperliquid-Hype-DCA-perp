@@ -81,6 +81,45 @@ def _require_env(name: str) -> str:
     return v.strip()
 
 
+def _addr_short(addr: str) -> str:
+    a = addr.strip()
+    if len(a) < 10:
+        return a
+    return f"{a[:6]}…{a[-4:]}"
+
+
+def hyperliquid_response_errors(resp: Any) -> list[str]:
+    """
+    Devuelve lista de errores legibles. Vacía => no se detectó fallo en el cuerpo típico
+    de Hyperliquid (status ok y sin error en statuses de órdenes).
+    """
+    errs: list[str] = []
+    if not isinstance(resp, dict):
+        return [f"respuesta no es objeto JSON: {resp!r}"]
+    if resp.get("status") != "ok":
+        return [f"status={resp.get('status')!r} — cuerpo: {resp!r}"]
+    inner = resp.get("response")
+    if not isinstance(inner, dict) or inner.get("type") != "order":
+        return []
+    data = inner.get("data") or {}
+    statuses = data.get("statuses")
+    if not isinstance(statuses, list):
+        return ["respuesta type=order sin lista statuses"]
+    if len(statuses) == 0:
+        return ["orden sin entradas en statuses (no ejecutada / rechazada sin detalle)"]
+    for s in statuses:
+        if isinstance(s, dict) and "error" in s:
+            errs.append(str(s["error"]))
+    return errs
+
+
+def abort_if_hyperliquid_errors(label: str, resp: Any) -> None:
+    errs = hyperliquid_response_errors(resp)
+    if errs:
+        log.error("%s: %s | respuesta API: %s", label, " | ".join(errs), resp)
+        sys.exit(1)
+
+
 def find_position(state: dict[str, Any], coin: str) -> Optional[dict[str, Any]]:
     for ap in state.get("assetPositions", []):
         pos = ap.get("position") or {}
@@ -136,15 +175,29 @@ def open_initial_long_if_flat(
     pos = find_position(state, coin)
     if pos:
         assert_long_only(pos, coin)
-        log.info(
-            "Ya hay posición long en %s (szi=%s). Sin compra inicial duplicada.",
+        pv = pos.get("positionValue", "n/a")
+        log.warning(
+            "NO se envía compra inicial: ya existe long en %s (szi=%s, positionValue=%s). "
+            "El bot solo monitoriza. Si querías abrir ~%s USDC nuevos, cierra esta posición "
+            "en Hyperliquid o cambia COIN.",
             coin,
             pos.get("szi"),
+            pv,
+            position_usd,
         )
         return pos
 
     mark = get_mid_price(info, coin)
     sz = usd_to_size(info, coin, position_usd, mark)
+    if sz <= 0:
+        log.error(
+            "Tamaño de orden 0 tras redondeo (POSITION_USD=%.4f, mark=%.8f, COIN=%s). "
+            "Sube POSITION_USD o revisa el activo.",
+            position_usd,
+            mark,
+            coin,
+        )
+        sys.exit(1)
     log.info(
         "Activación: compra inicial a mercado ~%.2f USDC en %s (sz=%s, mark=%.6f)",
         position_usd,
@@ -154,6 +207,7 @@ def open_initial_long_if_flat(
     )
     result = exchange.market_open(coin, True, sz, slippage=slippage)
     log.info("Respuesta orden inicial: %s", result)
+    abort_if_hyperliquid_errors("Compra inicial (market_open)", result)
 
     deadline = time.monotonic() + confirm_timeout_sec
     while time.monotonic() < deadline:
@@ -205,6 +259,15 @@ def main() -> None:
     info = exchange.info
 
     log.info(
+        "=== Bot Hyperliquid arrancando | API URL: %s ===",
+        base_url,
+    )
+    log.info(
+        "Firma con wallet API %s | cuenta (master) %s — deben coincidir con la API aprobada en HL.",
+        _addr_short(wallet.address),
+        _addr_short(account),
+    )
+    log.info(
         "Configurando %s | %sx aislado | compra defensiva %.2f USDC | TP %.0f%% nocional | "
         "defensa si mark <= liq + %.2f | rearm %.1f%% | gracia defensa %.0fs",
         coin,
@@ -215,7 +278,9 @@ def main() -> None:
         rearm_pct * 100,
         defense_grace_sec,
     )
-    exchange.update_leverage(leverage, coin, is_cross=False)
+    lev_resp = exchange.update_leverage(leverage, coin, is_cross=False)
+    log.info("Respuesta update_leverage: %s", lev_resp)
+    abort_if_hyperliquid_errors("update_leverage (aislado)", lev_resp)
 
     open_initial_long_if_flat(
         exchange,
@@ -326,7 +391,14 @@ def main() -> None:
                         liq,
                         sz,
                     )
-                    exchange.market_open(coin, True, sz, slippage=slippage)
+                    dresp = exchange.market_open(coin, True, sz, slippage=slippage)
+                    derr = hyperliquid_response_errors(dresp)
+                    if derr:
+                        log.error(
+                            "Compra defensiva rechazada por la API: %s | respuesta: %s",
+                            " | ".join(derr),
+                            dresp,
+                        )
                     armed = False
                     rearm_floor = T * (1.0 + rearm_pct)
 
