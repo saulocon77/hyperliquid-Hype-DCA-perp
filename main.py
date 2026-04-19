@@ -1,28 +1,30 @@
 """
 Bot Hyperliquid (HYPE perp, margen aislado, 10x) — versión simple.
 
-Al arrancar: una compra a mercado de POSITION_USD (nocional, default 30 USDC).
-Take profit: cuando el PnL no realizado >= TAKE_PROFIT_PCT * valor nocional de la posición
-(default 25% del tamaño de la posición en USDC). Sin stop loss. Al cumplir el TP cierra
-y apaga el proceso (exit 0).
+Al arrancar: configura apalancamiento aislado y, si no hay posición en COIN, envía una
+compra a mercado de ~POSITION_USD USDC de nocional. Si ya existía un long, no duplica la
+entrada y solo monitoriza.
 
-Compras defensivas (promediar / defender): se monitorea liquidationPx de la API. Si el
-precio de mercado (mid) cae de forma que mark <= liquidationPx + LIQUIDATION_BUFFER_USD
-(default 0.10 en unidades de precio del perp, equivalente práctico a USDT/USDC), se
-ejecuta de inmediato una compra a mercado del mismo nocional. Tras cada compra defensiva,
-el precio debe superar (liquidación+buffer)*(1+REARM_PCT) antes de poder volver a armar
-(evita ráfagas).
+Take profit: cuando el PnL no realizado >= TAKE_PROFIT_PCT * valor nocional de la
+posición (default 25% sobre el tamaño de la posición en USDC). Sin stop loss. Al cumplir
+el TP cierra con market_close y termina el proceso (exit 0).
+
+Compras defensivas: se usa liquidationPx de la API. Si el mid cae a mark <= liquidationPx +
+LIQUIDATION_BUFFER_USD (default 0.10 en unidades de precio del perp), se ejecuta al
+momento una compra a mercado del mismo nocional para promediar. Hasta cumplir
+DEFENSE_GRACE_AFTER_ACTIVATE_SEC desde la activación y hasta que el mid quede por encima
+del umbral (liq+buffer) no se “arma” la defensa (evita datos inestables al inicio). Tras
+cada defensa, el precio debe superar umbral*(1+REARM_PCT) antes de poder rearmar.
 
 Riesgos: acercarse a la liquidación aumenta el riesgo de pérdida. Un buffer fijo en
-precio (LIQUIDATION_BUFFER_USD) no representa el mismo margen relativo al precio de HYPE
-según cotice el activo; conviene revisar y ajustar ese valor en el entorno según tu
-tolerancia y el contexto de mercado.
+precio no es el mismo margen relativo según cotice HYPE; ajusta LIQUIDATION_BUFFER_USD en
+el entorno si hace falta.
 
 Variables de entorno (Railway):
   PRIVATE_KEY               — API wallet (0x...)
   ACCOUNT_ADDRESS           — wallet principal (0x...)
   COIN                      — default HYPE
-  POSITION_USD              — nocional por compra en USDC (default 30)
+  POSITION_USD              — nocional por compra (inicial y defensiva) en USDC (default 30)
   LEVERAGE                  — default 10
   TAKE_PROFIT_PCT           — fracción sobre el nocional (default 0.25 = 25%)
   LIQUIDATION_BUFFER_USD    — distancia máxima por encima de liquidationPx (default 0.10)
@@ -30,9 +32,8 @@ Variables de entorno (Railway):
   POLL_INTERVAL_SEC         — default 2.0
   TESTNET                   — default false
   SLIPPAGE                  — default 0.05
-  POST_ORDER_WAIT_SEC       — tras compra inicial, tiempo máx. esperando que aparezca la
-                              posición en la API (default 60). Evita salida en Railway por
-                              latencia entre orden y clearinghouseState.
+  DEFENSE_GRACE_AFTER_ACTIVATE_SEC — sin armar defensa tras activar (default 15; 0 = lo antes posible)
+  POSITION_CONFIRM_TIMEOUT_SEC     — máx. espera a ver la posición tras la compra inicial (default 90)
 """
 
 from __future__ import annotations
@@ -117,29 +118,57 @@ def usd_to_size(info: Info, coin: str, usd_notional: float, mark: float) -> floa
     return round_size(info, coin, usd_notional / mark)
 
 
-def wait_for_position(
+def open_initial_long_if_flat(
+    exchange: Exchange,
     info: Info,
     account: str,
     coin: str,
-    timeout_sec: float,
-    label: str,
+    position_usd: float,
+    slippage: float,
+    poll_interval: float,
+    confirm_timeout_sec: float,
 ) -> dict[str, Any]:
-    """Reintenta user_state hasta que exista posición en coin o se agote el tiempo."""
-    deadline = time.time() + timeout_sec
-    interval = 0.5
-    while time.time() < deadline:
+    """
+    Si no hay posición en coin, compra a mercado ~position_usd USDC de long.
+    Si ya hay long, lo devuelve sin orden nueva.
+    """
+    state = info.user_state(account)
+    pos = find_position(state, coin)
+    if pos:
+        assert_long_only(pos, coin)
+        log.info(
+            "Ya hay posición long en %s (szi=%s). Sin compra inicial duplicada.",
+            coin,
+            pos.get("szi"),
+        )
+        return pos
+
+    mark = get_mid_price(info, coin)
+    sz = usd_to_size(info, coin, position_usd, mark)
+    log.info(
+        "Activación: compra inicial a mercado ~%.2f USDC en %s (sz=%s, mark=%.6f)",
+        position_usd,
+        coin,
+        sz,
+        mark,
+    )
+    result = exchange.market_open(coin, True, sz, slippage=slippage)
+    log.info("Respuesta orden inicial: %s", result)
+
+    deadline = time.monotonic() + confirm_timeout_sec
+    while time.monotonic() < deadline:
+        time.sleep(poll_interval)
         state = info.user_state(account)
         pos = find_position(state, coin)
         if pos:
-            log.info("%s: posición %s detectada en API.", label, coin)
+            assert_long_only(pos, coin)
+            log.info("Posición inicial confirmada (szi=%s).", pos.get("szi"))
             return pos
-        time.sleep(interval)
+
     log.error(
-        "%s: sin posición en %s tras %.0fs. Revisa margen, autorización del API wallet, "
-        "ACCOUNT_ADDRESS y respuesta de la orden en logs anteriores.",
-        label,
+        "Timeout (%.0fs): no se reflejó posición en %s tras la compra inicial.",
+        confirm_timeout_sec,
         coin,
-        timeout_sec,
     )
     sys.exit(1)
 
@@ -166,7 +195,8 @@ def main() -> None:
     poll_sec = _env_float("POLL_INTERVAL_SEC", 2.0)
     slippage = _env_float("SLIPPAGE", 0.05)
     testnet = _env_bool("TESTNET", False)
-    post_order_wait = _env_float("POST_ORDER_WAIT_SEC", 60.0)
+    defense_grace_sec = _env_float("DEFENSE_GRACE_AFTER_ACTIVATE_SEC", 15.0)
+    position_confirm_timeout = _env_float("POSITION_CONFIRM_TIMEOUT_SEC", 90.0)
 
     base_url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
 
@@ -175,41 +205,40 @@ def main() -> None:
     info = exchange.info
 
     log.info(
-        "Configurando %s | %sx aislado | compra %.2f USDC nocional | TP %.0f%% nocional | "
-        "defensa si mark <= liq + %.2f | rearm tras defensa %.1f%%",
+        "Configurando %s | %sx aislado | compra defensiva %.2f USDC | TP %.0f%% nocional | "
+        "defensa si mark <= liq + %.2f | rearm %.1f%% | gracia defensa %.0fs",
         coin,
         leverage,
         position_usd,
         tp_pct * 100,
         liq_buffer,
         rearm_pct * 100,
+        defense_grace_sec,
     )
     exchange.update_leverage(leverage, coin, is_cross=False)
 
-    state0 = info.user_state(account)
-    pos0 = find_position(state0, coin)
-    mark0 = get_mid_price(info, coin)
+    open_initial_long_if_flat(
+        exchange,
+        info,
+        account,
+        coin,
+        position_usd,
+        slippage,
+        poll_sec,
+        position_confirm_timeout,
+    )
+    log.info(
+        "Bot activo en %s — take profit (%.0f%% del nocional), sin stop loss, compras defensivas si mark <= liq + %.2f.",
+        coin,
+        tp_pct * 100,
+        liq_buffer,
+    )
 
-    if pos0:
-        log.info("Ya hay posición en %s; no se hace compra inicial.", coin)
-    else:
-        sz0 = usd_to_size(info, coin, position_usd, mark0)
-        if sz0 <= 0:
-            log.error("Tamaño de orden 0; abortando.")
-            sys.exit(1)
-        log.info("Activación: compra inicial a mercado | sz=%s | mid≈%s", sz0, mark0)
-        init_resp = exchange.market_open(coin, True, sz0, slippage=slippage)
-        log.info("Respuesta compra inicial (exchange): %s", init_resp)
-        wait_for_position(
-            info,
-            account,
-            coin,
-            post_order_wait,
-            "Tras compra inicial",
-        )
-
-    armed = True
+    activation_mono = time.monotonic()
+    armed = False
     rearm_floor: Optional[float] = None
+    defense_primed = False
+    defense_arm_logged = False
 
     while True:
         try:
@@ -249,13 +278,41 @@ def main() -> None:
             else:
                 log.warning("liquidationPx no disponible; sin compra defensiva este ciclo.")
 
+            if defense_threshold is not None and mark > defense_threshold:
+                defense_primed = True
+
+            grace_ok = (time.monotonic() - activation_mono) >= defense_grace_sec
+            if (
+                grace_ok
+                and defense_primed
+                and not armed
+                and rearm_floor is None
+                and defense_threshold is not None
+                and mark > defense_threshold
+            ):
+                armed = True
+                if not defense_arm_logged:
+                    defense_arm_logged = True
+                    log.info(
+                        "Defensa armada: gracia de %.0fs cumplida y mark %.6f > umbral %.6f — "
+                        "compras defensivas permitidas si el precio cae a esa zona.",
+                        defense_grace_sec,
+                        mark,
+                        defense_threshold,
+                    )
+
             if rearm_floor is not None and mark > rearm_floor:
                 floor = rearm_floor
                 armed = True
                 rearm_floor = None
                 log.info("Rearmado defensa: mark %.6f > %.6f", mark, floor)
 
-            if armed and defense_threshold is not None and mark <= defense_threshold:
+            if (
+                defense_primed
+                and armed
+                and defense_threshold is not None
+                and mark <= defense_threshold
+            ):
                 T = defense_threshold
                 sz = usd_to_size(info, coin, position_usd, mark)
                 if sz <= 0:
@@ -274,13 +331,14 @@ def main() -> None:
                     rearm_floor = T * (1.0 + rearm_pct)
 
             log.info(
-                "mark=%.6f | liq=%s | umbral_def=%s | PnL=%.4f | nocional=%.2f | armed=%s",
+                "mark=%.6f | liq=%s | umbral_def=%s | PnL=%.4f | nocional=%.2f | armed=%s | defensa_primada=%s",
                 mark,
                 f"{liq:.6f}" if liq is not None else "n/a",
                 f"{defense_threshold:.6f}" if defense_threshold is not None else "n/a",
                 pnl,
                 abs(pos_value),
                 armed,
+                defense_primed,
             )
 
         except Exception as e:
